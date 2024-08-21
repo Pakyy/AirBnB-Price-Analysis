@@ -1,0 +1,382 @@
+---
+title: "Spatial Econometrics Project"
+author: "Pasquale Gravante"
+warning: false
+---
+
+# INTRODUCTION
+
+## Spatial Analysis on London AirBnb Data
+
+This dataset provides a comprehensive look at Airbnb prices in London in the weekends. Each listing is evaluated for various attributes such as room types, cleanliness and satisfaction ratings, bedrooms, distance from the city centre, and more to capture an in-depth understanding of Airbnb prices.
+
+## Data Description
+
+|                                |                                                                            |
+|--------------------------------|----------------------------------------------------------------------------|
+| **realSum**                    | The total price of the Airbnb listing. (Numeric)                           |
+| **room_type**                  | The type of room being offered (e.g. private, shared, etc.). (Categorical) |
+| **room_shared**                | Whether the room is shared or not. (Boolean)                               |
+| **room_private**               | Whether the room is private or not. (Boolean)                              |
+| **person_capacity**            | The maximum number of people that can stay in the room. (Numeric)          |
+| **host_is_superhost**          | Whether the host is a superhost or not. (Boolean)                          |
+| **multi**                      | Whether the listing is for multiple rooms or not. (Boolean)                |
+| **biz**                        | Whether the listing is for business purposes or not. (Boolean)             |
+| **cleanliness_rating**         | The cleanliness rating of the listing. (Numeric)                           |
+| **guest_satisfaction_overall** | The overall guest satisfaction rating of the listing. (Numeric)            |
+| **bedrooms**                   | The number of bedrooms in the listing. (Numeric)                           |
+| **dist**                       | The distance from the city centre. (Numeric)                               |
+| **metro_dist**                 | The distance from the nearest metro station. (Numeric)                     |
+| **lng**                        | The longitude of the listing. (Numeric)                                    |
+| **lat**                        | The latitude of the listing. (Numeric)                                     |
+
+## Research question
+
+How do spatial and non-spatial factors influence Airbnb prices in a given city, and what are the implications?
+
+# DATA PREPARATION
+
+## Loading libraries
+
+```{r}
+library(tidyverse)
+library(GWmodel)
+library(cluster)
+library(factoextra)
+library(leaflet)
+library(sf)
+library(sp)
+library(spatialreg)
+library(spdep)
+library(spgwr)
+```
+
+## Loading Data (Shapefile and csv file)
+
+Both the shapefile of London geographical data and the economic variables about Airbnb prices are uploaded.
+
+```{r}
+london <- st_read("London_Ward_CityMerged.shp")
+airbnb <- read_csv("london_weekends.csv")
+```
+
+# EDA
+
+In this section the structure of the economic data is explored.
+
+## Data Structure
+
+```{r}
+dim(airbnb)
+summary(airbnb)
+head(airbnb)
+```
+
+We've got data about 5379 listings (houses) and 20 variables (some feature selection will be made afterwards).
+
+## Listing on the map
+
+```{r}
+ggplot(airbnb, aes(x = lng, y = lat)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal()
+```
+
+With this graph we can see where in the space there more and where there are less Airbnb listings.
+
+## Data Manipulation
+
+Firstly, we ensure that both datasets have the same coordinate reference system (CRS).
+
+```{r}
+# Ensure both datasets have the same coordinate reference system (CRS)
+london <- st_transform(london, 4326)
+airbnb_spatial <- st_as_sf(airbnb, coords = c("lng", "lat"), crs=4326)
+joined_data <- st_join(airbnb_spatial, london, join = st_within)
+```
+
+Then, a variable selection is done and their values are aggregated by polygons (i.e., for each area of London, the average value of the variables for the listings in that space in taken).
+
+```{r}
+# List of variables
+vars <- c("realSum","person_capacity", "bedrooms", "dist", "guest_satisfaction_overall", "cleanliness_rating")
+
+# Aggregate point data by polygon (area) to compute mean values
+polygon_summary <- joined_data %>%
+  group_by(POLY_ID) %>%
+  summarise(
+    across(all_of(vars), ~ mean(.x, na.rm = TRUE))  
+  ) %>%
+  st_drop_geometry()
+
+# Retrieve polygon geometries from the original London dataset
+polygon_geometries <- london %>%
+  select(POLY_ID, geometry)
+
+# Merge polygon geometries with polygon summary using left_join
+final_summary <- left_join(polygon_summary, polygon_geometries, by = "POLY_ID")
+
+# Convert final_summary to an sf object
+final_summary <- st_as_sf(final_summary)
+```
+
+We now have a new dataset containing 223 areas of London and 6 economic variables for each one.
+
+# MODELING
+
+## Spatial weights
+
+```{r}
+cont.sf <- poly2nb(final_summary)
+spatial_weights <- nb2listw(cont.sf, style="W")
+```
+
+Spatial weights matrix is computed.
+
+## Spatial autocorrelation
+
+Moran's test for spatial autocorrelation is then performed:
+
+```{r}
+moran.test(final_summary$realSum, spatial_weights)
+```
+
+-   The Moran's I test results indicate that there is a **significant** **positive spatial autocorrelation** in the **price** variable among the spatial areas (polygons) represented in the dataset.
+
+-   This positive autocorrelation suggests that values of **price** tend to be similar among neighboring polygons, implying spatial clustering or patterns in the distribution of this variable across the study area.
+
+-   The strong statistical significance (very low p-value) reinforces the conclusion that the observed spatial autocorrelation is unlikely to occur by random chance alone.
+
+## Spatial Lag Model
+
+```{r}
+# Define the formula for the spatial lag model
+formula_lag <- realSum ~ person_capacity + bedrooms + dist + guest_satisfaction_overall + cleanliness_rating
+
+# Fit the spatial lag model
+model_lag <- lagsarlm(formula_lag, data = final_summary, listw = spatial_weights)
+
+# View summary of the spatial lag model
+summary(model_lag)
+```
+
+### **Interpretation:**
+
+#### **Coefficients:**
+
+-   **Intercept**: The estimated intercept is 134.6892, which represents the expected value of **price** when all other predictor variables are zero.
+
+-   **person_capacity**: For every unit increase in **person_capacity**, the expected value of **price** increases by 123.5157, holding other variables constant.
+
+-   **bedrooms**: The coefficient for **bedrooms** is 37.5831, suggesting that an increase in the number of bedrooms is associated with an increase in **price**, although the p-value (0.2396) indicates that this relationship is not statistically significant at conventional levels.
+
+-   **dist**: A one-unit increase in **dist** (distance) is associated with a decrease of 15.4734 in **price**. This negative coefficient is statistically significant (p-value \< 0.001), indicating that properties farther away tend to have lower **price** values.
+
+-   **guest_satisfaction_overall** and **cleanness_rating**: These coefficients are not statistically significant (p-values \> 0.05), suggesting that there is insufficient evidence to conclude that these variables have a linear relationship with **price**.
+
+#### **Spatial Autocorrelation:**
+
+-   **Rho (`Rho`)**: The spatial autoregressive parameter (rho) is estimated to be 0.2998. This indicates positive spatial autocorrelation, suggesting that similar values of **`realSum`** tend to occur in nearby locations.
+
+#### **Model Fit:**
+
+-   **AIC**: The Akaike Information Criterion (AIC) for the lag model is 2713.5, which is lower than the AIC for a standard linear regression (**lm**), indicating that the spatial lag model provides a better fit.
+
+#### **Residual Autocorrelation Test:**
+
+-   **LM Test for Residual Autocorrelation**: The LM test statistic (2.1082) with a p-value of 0.14652 tests for residual autocorrelation. A higher p-value (\> 0.05) suggests no significant evidence of residual autocorrelation, although caution should be exercised given the proximity to conventional significance levels.
+
+#### **Conclusions:**
+
+The spatial lag model reveals significant relationships between the **price** and the variables **person_capacity** and **dist**, while also detecting positive spatial autocorrelation, which suggests that nearby observations are more similar than those farther apart. This model provides valuable insights into the spatial dependency of the **price** variable and the role of different predictors in explaining variations in this variable.
+
+## Spatial Error Model
+
+Since we now know that there is **spatial autocorrelation**, a **spatial error model** is used to account for it.
+
+```{r}
+# Define the formula for the spatial error model
+formula_error <- realSum ~ person_capacity + bedrooms + dist + guest_satisfaction_overall + cleanliness_rating
+
+# Fit the spatial error model using errorsarlm
+model_error <- errorsarlm(formula_error, data = final_summary, listw = spatial_weights)
+
+# Summarize the model results
+summary(model_error)
+```
+
+The spatial error model's results provide insights into how the specified predictors influence the **price** while considering spatial effects in the data. The significant **Lambda** value and model fit statistics support the validity and usefulness of this modeling approach for this purpose.
+
+## Geographically Weighted Regression
+
+### Data preparation
+
+Firstly, centroids of each London area are created.
+
+```{r}
+crds.sf<-st_centroid(final_summary$geometry)
+crds<-st_coordinates(crds.sf)
+```
+
+Then, the formula for the regression in created:
+
+```{r}
+formula_gwr <- realSum ~ person_capacity + bedrooms + dist + guest_satisfaction_overall + cleanliness_rating
+```
+
+Lastly, the optimal **bandwidth** for the kernel is computed:
+
+```{r}
+bw<-ggwr.sel(formula_gwr, data=final_summary, coords=crds, family=poisson(), longlat=TRUE)
+```
+
+### Model
+
+Finally, a **Generalized Geographically Weighted Regression** is run:
+
+```{r}
+# Compute GGWR model with bandwidth selection
+ggwr_model <- ggwr(formula_gwr, data = final_summary, longlat = TRUE, coords = crds, bandwidth = bw)
+
+# Summary of GGWR model
+ggwr_model
+```
+
+-   GWR coefficient estimates help to understand how the relationships between variables differ across space, providing insights into local variations that may not be captured by a traditional global regression model. They highlight the spatial heterogeneity in the studied relationships and can be used as a guide to more targeted and context-specific interpretations.
+
+-   For instance, if **person_capacity** has a median coefficient estimate of 116 and a wide range from 82 to 226 across different locations, it suggests that the effect of **person_capacity** on the **price** varies substantially depending on the specific geographic context. Some areas might show a stronger positive relationship between **person_capacity** and **price**, while others might exhibit weaker or negative relationships.
+
+### Visualization
+
+We can see this graphically:
+
+```{r}
+plots_data <- final_summary
+par(mfrow = c(3, 2))
+plots_data$GWR.person_capacity<-ggwr_model$SDF$person_capacity
+ggplot()+geom_sf(data=plots_data, aes(fill=GWR.person_capacity))
+plots_data$GWR.bedrooms<-ggwr_model$SDF$bedrooms
+ggplot()+geom_sf(data=plots_data, aes(fill=GWR.bedrooms))
+plots_data$GWR.dist<-ggwr_model$SDF$dist
+ggplot()+geom_sf(data=plots_data, aes(fill=GWR.dist))
+plots_data$GWR.guest_satisfaction_overall<-ggwr_model$SDF$guest_satisfaction_overall
+ggplot()+geom_sf(data=plots_data, aes(fill=GWR.guest_satisfaction_overall))
+plots_data$GWR.cleanliness_rating<-ggwr_model$SDF$cleanliness_rating
+ggplot()+geom_sf(data=plots_data, aes(fill=GWR.cleanliness_rating))
+```
+
+-   Regions with **darker colors** suggest locations where the relationships between the predictors and the response variable are **less impactful** or where other unmodeled factors might be more influential.
+
+-   **Brighter colors** highlight locations where the predictor variables **strongly explain** variations in the response variable. These areas could be significant for targeted interventions or further investigation.
+
+### Boxplot
+
+```{r}
+boxplot(as.data.frame(ggwr_model$SDF)[,3:7])
+abline(h=0, lty=3, lwd=2, col="red")
+```
+
+-   This boxplot provides insights into the distribution and variability of the GWR coefficient estimates for each predictor variable. By analyzing this boxplot, some can spatial patterns in how different predictors impact the response variable, can be revealed.
+
+-   For example, if certain predictors consistently show positive or negative coefficients across most locations, it suggests spatially varying relationships. This is the case of the variables **person_capacity** and **bedrooms.**
+
+# CLUSTERING
+
+We are now going to perform clustering of the different areas:
+
+## Optimal number of clusters
+
+```{r}
+fviz_nbclust(as.data.frame(ggwr_model$SDF[,3:7]), FUNcluster=kmeans)
+```
+
+-   As we can see from the graph, the best number of clusters according to the **Silhouette index** is 3, even though 2 or 4 also fine.
+
+## K-Means
+
+K-Means clustering algorithm is then performed by selecting 3 clusters:
+
+```{r}
+km3c <- eclust(as.data.frame(ggwr_model$SDF[,3:7]), "kmeans", k=3)
+plots_data$clust3 <- km3c$cluster
+ggplot() + geom_sf(data=plots_data, aes(fill=clust3))
+```
+
+-   The clustering analysis applied to GWR coefficients helps in identifying spatial groupings of locations with similar predictor-response relationships. It facilitates the exploration of spatial patterns, differentiation between areas, and identification of localized trends and variations in the study area.
+-   As we can see from the graph, around 60% of the total variability is explained, which is not bad.
+
+# MODELING II
+
+Let's now create dummy variables representing clusters and add them to the model:
+
+```{r}
+final_summary$clust1<-rep(0, times=dim(final_summary)[1])
+final_summary$clust1[km3c$cluster==1]<-1
+final_summary$clust2<-rep(0, times=dim(final_summary)[1])
+final_summary$clust2[km3c$cluster==2]<-1
+final_summary$clust3<-rep(0, times=dim(final_summary)[1])
+final_summary$clust3[km3c$cluster==3]<-1
+final_summary$clust4<-rep(0, times=dim(final_summary)[1])
+```
+
+## Spatial Error Model
+
+By adding the dummy variables to the model, we are controlling for **spatial drift**.
+
+```{r}
+new_eq <- realSum ~ person_capacity + bedrooms + dist + guest_satisfaction_overall + cleanliness_rating + clust1 + clust2
+```
+
+```{r}
+model.sem<-errorsarlm(new_eq, data=final_summary, spatial_weights)
+summary(model.sem)
+```
+
+### 
+
+-   The significant Lambda and test statistics suggest that there is spatial autocorrelation in the residuals of the model, indicating that nearby locations still exhibit similar "realSum" (**price)** values even after accounting for all specified predictors and spatially varying effects (**clust1**, **clust2**).
+
+-   The estimated coefficients for each predictor and dummy variable provide insights into how these variables influence **price** in the presence of spatial effects. For example, **person_capacity** and **dist** have significant impacts on the **price**, while the dummy variables (**clust1**, **clust2**) capture additional spatial variability in the price.
+
+In summary, the spatial error model with dummy variables (**clust1**, **clust2**) helps to control for spatial heterogeneity and autocorrelation in the residuals, providing a more accurate and robust analysis of the relationship between the price and the predictor variables within a spatial context. The model results highlight the importance of considering spatial effects when analyzing geographic data.
+
+## OLS Model with dummies
+
+Lastly, we also include a linear model where the clusters are include to do a comparison:
+
+```{r}
+ols_model<-lm(new_eq, data=final_summary)
+summary(ols_model)
+```
+
+# CONCLUSIONS
+
+## Modeling
+
+-   According to the **R-squared**, with the linear model we are only able to explain **50%** of the variability of the data.
+
+-   Among the models, the **Spatial Error Model** and the **Geographically Weighted Regression** appear to perform better based on lower AIC values and potentially improved model fit compared to OLS. The inclusion of spatial weights and clustering variables also improved the fit of these models.
+
+-   Finally, we can say that for this purpose the need to account for spatial information is crucial for proper analysis and conclusions.
+
+## Answers to the research question
+
+The research conducted in this project reveals that both spatial and non-spatial factors significantly influence Airbnb prices. The key findings can be summarized as follows:
+
+1.  **Influence of Location (Spatial Factors)**:
+
+    -   **Distance to Amenities**: Properties located closer to popular attractions, city centers, or transportation hubs generally command higher prices. This is evidenced by the significant negative coefficient for the distance variable (**dist**) in both the spatial error model and the geographically weighted regression (GWR).
+
+    -   **Spatial Autocorrelation**: The presence of positive spatial autocorrelation indicates that Airbnb prices are not randomly distributed but are spatially clustered. This means that high-priced properties are often located near other high-priced properties, and the same holds for low-priced properties. This was confirmed by the Moran's I statistic and the results of spatial lag and error models.
+
+2.  **Property Characteristics (Non-Spatial Factors)**:
+
+    -   **Capacity and Size**: Larger properties with more bedrooms and higher guest capacity have higher prices. The coefficients for **person_capacity** and **bedrooms** are positive and significant across models.
+
+    -   **Quality Ratings**: Guest satisfaction and cleanliness ratings have a positive, although not always statistically significant, impact on prices.
+
+3.  **Local Variations and Clustering**
+
+    -   **GWR Analysis**: The GWR model highlights that the influence of these factors varies across different areas of the city. For instance, the impact of distance to amenities on price is more pronounced in some neighborhoods than others. This local variation can be crucial for hosts aiming to optimize pricing based on their specific location.
+
+    -   **Cluster Analysis**: The clustering analysis revealed distinct groups of properties with similar characteristics and pricing behaviors. These clusters can help hosts understand their competition and market segment, allowing for more targeted marketing and pricing strategies.
